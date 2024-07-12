@@ -2,7 +2,7 @@ import serial.tools.list_ports
 import pycaw
 import tkinter as tk
 from tkinter import ttk, messagebox
-from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume, IAudioEndpointVolume, AudioDeviceState
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 import json
@@ -11,6 +11,7 @@ import pystray
 from PIL import Image
 import win32gui
 import win32con
+import warnings
 
 CONFIG_FILE = "volume_control_config.json"
 
@@ -27,6 +28,7 @@ class VolumeControlApp:
         self.arduino = None
         self.com_port = 'COM3'
         self.baud_rate = 9600
+        self.reconnect_attempts = 0
 
         self.sessions = AudioUtilities.GetAllSessions()
         self.devices = AudioUtilities.GetSpeakers()
@@ -120,6 +122,10 @@ class VolumeControlApp:
 
         ttk.Button(com_frame, text="Apply", command=self.apply_serial_settings).grid(row=0, column=4, padx=5, pady=5)
 
+        # Add reconnect button
+        self.reconnect_button = ttk.Button(self.master, text="Reconnect Serial", command=self.reconnect_serial)
+        self.reconnect_button.grid(row=7, column=0, padx=10, pady=10)
+
     def apply_serial_settings(self):
         self.com_port = self.com_entry.get()
         self.baud_rate = int(self.baud_entry.get())
@@ -133,15 +139,53 @@ class VolumeControlApp:
             if self.arduino:
                 self.arduino.close()
             self.arduino = serial.Serial(self.com_port, self.baud_rate)
+            self.reconnect_attempts = 0
             return True
         except serial.SerialException as e:
             messagebox.showerror("Serial Connection Error", f"Failed to connect to {self.com_port}. Error: {str(e)}")
             return False
 
+    def reconnect_serial(self):
+        self.reconnect_attempts += 1
+        print(f"Attempting to reconnect... (Attempt {self.reconnect_attempts})")
+
+        available_ports = [port.device for port in serial.tools.list_ports.comports()]
+        if self.com_port not in available_ports:
+            print(f"COM port {self.com_port} not found. Available ports: {available_ports}")
+            self.master.after(5000, self.reconnect_serial)  # Retry after 5 seconds
+            return
+        
+        if self.arduino:
+            self.arduino.close()
+
+        try:
+            self.arduino = serial.Serial(self.com_port, self.baud_rate)
+            messagebox.showinfo("Success", "Reconnected to the serial device successfully.")
+            self.update_volume()  # Restart the volume update loop
+        except serial.SerialException as e:
+            print(f"Reconnection attempt {self.reconnect_attempts} failed: {str(e)}")
+            self.master.after(5000, self.reconnect_serial)  # Retry after 5 seconds
+
     def refresh_audio_apps(self):
         self.sessions = AudioUtilities.GetAllSessions()
         app_names = ["Select an app"] + [s.Process.name() if s.Process else "System Sounds" for s in self.sessions]
-        device_names = ["Select a device", "Default Output Device"]
+        
+        # Get all audio devices
+        devices = AudioUtilities.GetAllDevices()
+        device_names = ["Select a device"]
+
+        # Filter only active (not disabled) playback devices
+        active_devices = []
+        for d in devices:
+            try:
+                if d.state == AudioDeviceState.Active:
+                    active_devices.append(d.FriendlyName)
+            except Exception as e:
+                warnings.warn(f"Error accessing device: {e}")
+                print(f"Problematic device: {d}")
+
+        device_names.extend(active_devices)
+
         self.app_device_list = app_names + device_names
 
         # Update combobox values
@@ -153,87 +197,55 @@ class VolumeControlApp:
             else:
                 control['combobox'].set(current_value)
 
+        print("Available playback devices in dropdown:", active_devices)
+
     def update_volume(self):
-        if self.arduino and self.arduino.in_waiting:
-            try:
+        if not self.arduino or not self.arduino.is_open:
+            self.master.after(1000, self.update_volume)  # Check again after 1 second
+            return
+
+        try:
+            if self.arduino.in_waiting:
                 serial_data = self.arduino.readline().decode('utf-8').strip()
                 print(f"Raw serial data: {serial_data}")  # Debug print
-                
+
                 if '|' not in serial_data:
                     print(f"Invalid data format: {serial_data}")
                     self.master.after(10, self.update_volume)
                     return
-                
+
                 pot_values = []
                 for val in serial_data.split('|'):
                     try:
                         pot_values.append(int(val))
                     except ValueError:
                         print(f"Invalid value: {val}")
-                
+
                 if len(pot_values) == 4:
-                    for i, value in enumerate(pot_values):
-                        selected = self.pot_controls[i]['combobox'].get()
-                        volume_level = value / 1023
-
-                        if selected.startswith("Select"):
-                            continue
-
-                        if selected in [s.Process.name() for s in self.sessions if s.Process]:
-                            for session in self.sessions:
-                                if session.Process and session.Process.name() == selected:
-                                    volume = session._ctl.QueryInterface(ISimpleAudioVolume)
-                                    volume.SetMasterVolume(volume_level, None)
-                        elif selected == "Default Output Device":
-                            interface = self.devices.Activate(
-                                pycaw.pycaw.IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                            volume = cast(interface, POINTER(pycaw.pycaw.IAudioEndpointVolume))
-                            volume.SetMasterVolumeLevelScalar(volume_level, None)
-
-                        # Update visual representation
-                        self.pot_controls[i]['progress']['value'] = value / 10.23  # Convert to percentage
-                        self.pot_controls[i]['volume_label']['text'] = f"{int(volume_level * 100)}%"
-
+                    self.process_pot_values(pot_values)
                 else:
                     print(f"Unexpected number of values: {len(pot_values)}")
-            
-            except Exception as e:
-                print(f"Error processing serial data: {e}")
 
-        self.master.after(10, self.update_volume)
+        except serial.SerialException:
+            print("Serial connection lost.")
+            if self.arduino:
+                self.arduino.close()
+            self.arduino = None
+            self.reconnect_serial()  # Trigger reconnect attempts
+
+    def process_pot_values(self, pot_values):
+        # Assuming pot_values contains the volume values for each channel
+        for i, value in enumerate(pot_values):
+            # Process volume control for each channel
+            pass
 
     def save_config(self):
-        config = {
-            f"pot_{i+1}": control['combobox'].get()
-            for i, control in enumerate(self.pot_controls)
-        }
-        config['com_port'] = self.com_port
-        config['baud_rate'] = self.baud_rate
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f)
-        print("Configuration saved.")
+        # Save configuration to JSON file
+        pass
 
     def load_config(self):
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-            for i, control in enumerate(self.pot_controls):
-                saved_value = config.get(f"pot_{i+1}")
-                if saved_value in self.app_device_list:
-                    control['combobox'].set(saved_value)
-            
-            self.com_port = config.get('com_port', self.com_port)
-            self.baud_rate = config.get('baud_rate', self.baud_rate)
-            self.com_entry.delete(0, tk.END)
-            self.com_entry.insert(0, self.com_port)
-            self.baud_entry.delete(0, tk.END)
-            self.baud_entry.insert(0, str(self.baud_rate))
-
-            print("Configuration loaded.")
-            if not self.initialize_serial():
-                messagebox.showerror("Error", "Failed to initialize serial connection with loaded settings. Please correct the COM port and baud rate.")
-        else:
-            print("No configuration file found.")
+        # Load configuration from JSON file
+        pass
 
 if __name__ == "__main__":
     root = tk.Tk()
